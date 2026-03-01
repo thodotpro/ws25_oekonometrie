@@ -1,0 +1,307 @@
+---
+title: "Aufgabe 2 Ökonometrie – Zeitreihenanalyse (Datensatz 2)"
+author: "Gruppe: Proktsch, De Lorenzo, Ebner, Uller"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 4.5
+)
+
+# Pakete
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(knitr)
+library(kableExtra)
+```
+
+# 1. Einleitung und Ziel
+
+In dieser Aufgabe wird eine Zeitreihenanalyse auf Basis eines täglichen Bitcoin-Datensatzes (OHLC-Preise in USD und SAR sowie Handelsvolumen) durchgeführt. Ziel ist:
+
+- eine **deskriptive Beschreibung** des Datensatzes,
+- eine **grafische Exploration** inkl. Prüfung wichtiger **Voraussetzungen** (u. a. Stationarität),
+- die **Schätzung** eines Zeitreihenmodells (ARIMA),
+- die **Evaluierung** der Prognosegüte (Train/Test, Fehlermaße, Residualdiagnostik).
+
+> Hinweis: Die SAR-Spalten sind (typischerweise) eine Umrechnung von USD mit (nahezu) konstantem Wechselkursfaktor. Für die Zeitreihenanalyse reicht die USD-Serie aus.
+
+# 2. Daten einlesen und vorbereiten
+
+```{r import}
+# Dateipfad: Falls nötig anpassen (z.B. "data/Datensatz2.csv")
+df <- read.csv("Datensatz2.csv")
+
+# Falls die Datumsspalte als "Unnamed: 0" oder "Unnamed..0" kommt:
+date_col <- intersect(names(df), c("Unnamed: 0", "Unnamed..0", "X", "Date", "date"))[1]
+stopifnot(!is.na(date_col))
+
+df <- df %>%
+  rename(date = all_of(date_col)) %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date)
+
+# Zusätzliche Reihen: log-Preis und Renditen
+df <- df %>%
+  mutate(
+    log_close = log(close_USD),
+    ret = c(NA, diff(log_close))
+  )
+
+glimpse(df)
+```
+
+## 2.1 Überblick / Fehlende Werte
+
+```{r missing}
+# Fehlende Werte je Spalte
+na_tbl <- tibble(
+  variable = names(df),
+  n_missing = colSums(is.na(df))
+)
+
+kable(na_tbl, caption = "Fehlende Werte je Variable") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 2.2 Deskriptive Statistik (Close & Volume)
+
+```{r descriptives}
+desc <- df %>%
+  summarise(
+    start = min(date),
+    end   = max(date),
+    n     = n(),
+    close_min = min(close_USD, na.rm = TRUE),
+    close_max = max(close_USD, na.rm = TRUE),
+    close_mean = mean(close_USD, na.rm = TRUE),
+    close_sd   = sd(close_USD, na.rm = TRUE),
+    close_median = median(close_USD, na.rm = TRUE),
+    vol_min = min(volume, na.rm = TRUE),
+    vol_max = max(volume, na.rm = TRUE),
+    vol_mean = mean(volume, na.rm = TRUE),
+    vol_sd   = sd(volume, na.rm = TRUE)
+  )
+
+kable(desc, digits = 3, caption = "Deskriptive Kennzahlen für Close (USD) und Volume") %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Interpretation:**  
+Der Datensatz umfasst tägliche Beobachtungen (Start/Ende 2018-05-07/2021-01-30) und zeigt – typisch für Kryptowährungen – stark schwankende Preisniveaus und Volumen-Spitzen. Damit ist mit **Nicht-Stationarität** im Preisniveau und mit **hoher Volatilität** zu rechnen.
+
+# 3. Diagramme und Voraussetzungen
+
+## 3.1 Zeitreihenplots (Preis, Log-Preis, Volumen)
+
+```{r plots-overview}
+p1 <- ggplot(df, aes(x = date, y = close_USD)) +
+  geom_line() +
+  labs(title = "BTC Close (USD)", x = "Datum", y = "Close_USD")
+
+p2 <- ggplot(df, aes(x = date, y = log_close)) +
+  geom_line() +
+  labs(title = "log(BTC Close)", x = "Datum", y = "log(Close_USD)")
+
+p3 <- ggplot(df, aes(x = date, y = volume)) +
+  geom_line() +
+  labs(title = "Handelsvolumen", x = "Datum", y = "Volume")
+
+p1
+p2
+p3
+```
+
+**Interpretation:**  
+- Der Preisverlauf weist deutliche Trend- und Regimephasen auf → das spricht gegen Stationarität im Niveau.  
+- Der Log-Preis macht Levelunterschiede besser interpretierbar, bleibt aber trendbehaftet.  
+- Das Volumen zeigt Cluster und Ausreißer, typisch für ereignisgetriebene Märkte.
+
+## 3.2 Stationarität: ADF und KPSS (Preisniveau vs. Differenzen)
+
+Wir testen die Stationarität der Zeitreihe. Bei Finanzpreisen ist es üblich, dass die **Preisniveaus** nicht stationär sind, wohingegen **Differenzen** bzw. **log-Renditen** eher stationär sind.
+
+```{r stationarity}
+# ADF: H0 = Unit Root (nicht stationär)
+adf_price <- adf.test(df$close_USD)
+
+# KPSS: H0 = stationär
+kpss_price <- kpss.test(df$close_USD)
+
+# Erste Differenz (Preisänderung)
+d_close <- diff(df$close_USD)
+adf_diff <- adf.test(na.omit(d_close))
+kpss_diff <- kpss.test(na.omit(d_close))
+
+# Log-Rendite (ret)
+adf_ret <- adf.test(na.omit(df$ret))
+kpss_ret <- kpss.test(na.omit(df$ret))
+
+tests <- tibble(
+  Serie = c("close_USD (Niveau)", "diff(close_USD)", "log-return"),
+  ADF_p_value = c(adf_price$p.value, adf_diff$p.value, adf_ret$p.value),
+  KPSS_p_value = c(kpss_price$p.value, kpss_diff$p.value, kpss_ret$p.value)
+)
+
+kable(tests, digits = 4, caption = "Stationaritätstests (p-Werte): ADF und KPSS") %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Interpretation der Tests (Leitlinien):**
+- **ADF**: kleine p-Werte (z. B. < 0.05) → gegen Unit Root → eher stationär.  
+- **KPSS**: große p-Werte (z. B. > 0.05) → stationär wird *nicht* verworfen.  
+
+Wenn `close_USD` im Niveau nicht stationär ist, modellieren wir typischerweise mit einer **Differenzierung** (ARIMA mit d=1) oder arbeiten mit **Returns**.
+
+## 3.3 ACF/PACF (für Differenzen oder Returns)
+
+```{r acf-pacf}
+par(mfrow = c(1,2))
+Acf(na.omit(df$ret), main = "ACF log-returns")
+Pacf(na.omit(df$ret), main = "PACF log-returns")
+par(mfrow = c(1,1))
+```
+
+**Interpretation:**  
+ACF/PACF helfen, AR- und MA-Strukturen zu erkennen. Bei Returns ist häufig nur wenig Autokorrelation sichtbar; viele Dynamiken stecken eher in der Volatilität (GARCH), was hier **nicht** Teil der Pflichtaufgabe ist.
+
+# 4. Durchführung der Zeitreihenanalyse (ARIMA)
+
+Wir erstellen eine Prognose und evaluieren sie mit einem Train/Test-Split.
+
+## 4.1 Train/Test Split
+
+```{r split}
+h <- 90  # Testfenster / Prognosehorizont
+
+train <- df %>% slice(1:(n()-h))
+test  <- df %>% slice((n()-h+1):n())
+
+# ts-Objekt für forecast/ARIMA (tägliche Daten, frequency pragmatisch)
+y_train <- ts(train$close_USD, frequency = 365)
+y_test  <- ts(test$close_USD,  frequency = 365)
+
+c(n_train = length(y_train), n_test = length(y_test))
+```
+
+## 4.2 Modell: Auto-ARIMA (ohne Saisonalität)
+
+```{r fit-arima}
+fit_arima <- auto.arima(
+  y_train,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+fit_arima
+```
+
+**Interpretation:**  
+`auto.arima()` wählt (p,d,q) datengetrieben nach Informationskriterien. Bei Preisniveaus kommt oft ein Modell nahe **Random Walk** (d=1) heraus.
+
+## 4.3 Prognose und Visualisierung
+
+```{r forecast-plot}
+fc_arima <- forecast(fit_arima, h = h)
+
+autoplot(fc_arima) +
+  autolayer(y_test, series = "Test") +
+  labs(title = "ARIMA Forecast vs. Testdaten", x = "Zeit", y = "Close_USD")
+```
+
+**Interpretation:**  
+Die Prognose zeigt die Punktvorhersage und Unsicherheitsintervalle. Bei volatilen Märkten sind die Intervalle typischerweise breit.
+
+# 5. Evaluierung der Zeitreihenanalyse
+
+## 5.1 Fehlermaße (RMSE/MAE/MAPE)
+
+```{r accuracy}
+# Forecast- und Testwerte als Vektoren
+fc_vals   <- as.numeric(fc_arima$mean)
+test_vals <- as.numeric(y_test)
+
+# Fehlermaße berechnen
+acc_tbl <- data.frame(
+  RMSE = sqrt(mean((test_vals - fc_vals)^2)),
+  MAE  = mean(abs(test_vals - fc_vals)),
+  MAPE = mean(abs((test_vals - fc_vals) / test_vals)) * 100
+)
+
+kable(acc_tbl, digits = 4,
+      caption = "Forecast-Accuracy ARIMA (Testdaten)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 5.2 Benchmarks: Naive / Drift / ETS
+
+Wir vergleichen ARIMA mit einfachen Benchmarks. Gerade bei Finanzpreisen sind **Naive/Drift** oft sehr stark.
+
+
+```{r benchmarks}
+# Testwerte
+test_vals <- as.numeric(y_test)
+
+fc_naive <- naive(y_train, h = h)
+fc_drift <- rwf(y_train, drift = TRUE, h = h)
+fit_ets  <- ets(y_train)
+fc_ets   <- forecast(fit_ets, h = h)
+
+# Fehlermaß-Hilfsfunktion
+acc_fun <- function(fc, test) {
+  fc_vals <- as.numeric(fc$mean)
+  c(
+    RMSE = sqrt(mean((test - fc_vals)^2)),
+    MAE  = mean(abs(test - fc_vals)),
+    MAPE = mean(abs((test - fc_vals) / test)) * 100
+  )
+}
+
+# Modellvergleich zusammenfügen
+comp <- rbind(
+  ARIMA = acc_fun(fc_arima, test_vals),
+  NAIVE = acc_fun(fc_naive, test_vals),
+  DRIFT = acc_fun(fc_drift, test_vals),
+  ETS   = acc_fun(fc_ets,   test_vals)
+)
+
+kable(as.data.frame(comp), digits = 4,
+      caption = "Modellvergleich (Testdaten)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Interpretation:**  
+- Wenn ARIMA nicht deutlich besser als Naive/Drift ist, ist das bei Preisniveaus **normal** (Random-Walk-Charakter).  
+- Ein Modell ist trotzdem sinnvoll, wenn Residuen „weißes Rauschen“ sind und die Prognoseintervalle die Unsicherheit realistisch abbilden.
+
+## 5.3 Residualdiagnostik
+
+```{r residuals}
+checkresiduals(fit_arima)
+```
+
+**Interpretation:**  
+- **ACF der Residuen**: keine signifikanten Strukturen → Modell erfasst Autokorrelation.  
+- **Ljung-Box**: p-Wert > 0.05 ist wünschenswert (keine Restautokorrelation).  
+- **Normalität**: bei Krypto oft verletzt (fette Tails). Das ist üblich und sollte erwähnt werden.
+
+# 6. Fazit
+
+- Die Zeitreihe `close_USD` ist im Niveau typischerweise **nicht stationär**; Differenzen/Returns sind deutlich stationärer.  
+- Mit einem ARIMA-Modell (datengetriebene Wahl) wurde eine **Kurzfristprognose** erstellt und auf einem Testfenster evaluiert.  
+- Benchmarks (Naive/Drift/ETS) dienen als Referenz; bei BTC sind sie oft sehr konkurrenzfähig.  
+- Residualdiagnostik ist essenziell zur Beurteilung, ob das Modell adäquat ist.
